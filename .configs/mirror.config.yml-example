@@ -4,6 +4,7 @@ filters:
       # Filters arguments
       format: "{message_text}\n\nForwarded from [{channel_name}]({message_link})"
   - EmptyMessageFilter
+  - RestrictSavingContentBypassFilter # for forwarding from channels with restrictions
   - UrlMessageFilter:
       blacklist: !!set
         ? t.me
