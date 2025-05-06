@@ -63,6 +63,8 @@
     - SkipUrlFilter:
         skip_mention: false # Filter bool argument
 
+    - RestrictSavingContentBypassFilter # no args, use for copy messages and media from private channels
+
     - UrlMessageFilter:
         blacklist: !!set    # Filter set argument
             ? t.me
