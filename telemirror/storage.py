@@ -1,7 +1,6 @@
 from abc import abstractmethod
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from typing import Any, AsyncIterator, List, Protocol
+from typing import Any, AsyncIterator, List, NamedTuple, Protocol
 
 from psycopg import AsyncCursor, errors
 from psycopg.rows import class_row
@@ -10,8 +9,7 @@ from psycopg_pool import AsyncConnectionPool
 from .misc.lrucache import LRUCache
 
 
-@dataclass
-class MirrorMessage:
+class MirrorMessage(NamedTuple):
     """
     Mirror message class contains id message mappings:
 
@@ -153,7 +151,7 @@ class InMemoryDatabase(Database):
             entity (`MirrorMessage`): `MirrorMessage` object
         """
         self.__storage.setdefault(
-            self.__build_message_hash(entity.original_id, entity.original_channel), []
+            self.__build_message_key(entity.original_id, entity.original_channel), []
         ).append(entity)
 
     async def insert_batch(
@@ -165,7 +163,9 @@ class InMemoryDatabase(Database):
             entity (`List[MirrorMessage]`): List of `MirrorMessage` objects
         """
         for e in entity:
-            await self.insert(e)
+            self.__storage.setdefault(
+                self.__build_message_key(e.original_id, e.original_channel), []
+            ).append(e)
 
     async def get_messages(
         self: "InMemoryDatabase", original_id: int, original_channel: int
@@ -181,7 +181,7 @@ class InMemoryDatabase(Database):
             List[MirrorMessage]
         """
         return self.__storage.get(
-            self.__build_message_hash(original_id, original_channel), []
+            self.__build_message_key(original_id, original_channel), []
         )
 
     async def get_messages_batch(
@@ -197,10 +197,13 @@ class InMemoryDatabase(Database):
         Returns:
             List[MirrorMessage]
         """
-        messages: List[MirrorMessage] = []
-        for idx in original_ids:
-            messages.extend(await self.get_messages(idx, original_channel))
-        return messages
+        return [
+            msg
+            for idx in original_ids
+            for msg in self.__storage.get(
+                self.__build_message_key(idx, original_channel), []
+            )
+        ]
 
     async def delete_messages(
         self: "InMemoryDatabase", original_id: int, original_channel: int
@@ -212,10 +215,9 @@ class InMemoryDatabase(Database):
             original_id (`int`): Original message ID
             original_channel (`int`): Source channel ID
         """
-        try:
-            del self.__storage[self.__build_message_hash(original_id, original_channel)]
-        except KeyError:
-            pass
+        self.__storage.pop(
+            self.__build_message_key(original_id, original_channel), None
+        )
 
     async def delete_messages_batch(
         self: "InMemoryDatabase", original_ids: List[int], original_channel: int
@@ -228,13 +230,13 @@ class InMemoryDatabase(Database):
             original_channel (`int`): Source channel ID
         """
         for idx in original_ids:
-            await self.delete_messages(idx, original_channel)
+            self.__storage.pop(self.__build_message_key(idx, original_channel), None)
 
-    def __build_message_hash(
+    def __build_message_key(
         self: "InMemoryDatabase", original_id: int, original_channel: int
     ) -> str:
         """
-        Builds message hash from `original_id` and `original_channel` values
+        Builds message key from `original_id` and `original_channel` values
 
         Args:
             original_id (`int`): Original message ID
@@ -290,8 +292,10 @@ class PostgresDatabase(Database):
             conninfo=self.__conn_info,
             min_size=self.__min_conn,
             max_size=self.__max_conn,
+            open=False,
             **self.__kwargs,
         )
+        await self.connection_pool.open()
         await self.__create_tables_if_not_exists()
         return self
 
@@ -329,15 +333,7 @@ class PostgresDatabase(Database):
                 INSERT INTO binding_id (original_id, original_channel, mirror_id, mirror_channel)
                 VALUES (%s, %s, %s, %s)
                 """,
-                [
-                    (
-                        e.original_id,
-                        e.original_channel,
-                        e.mirror_id,
-                        e.mirror_channel,
-                    )
-                    for e in entity
-                ],
+                entity,
             )
 
     async def get_messages(
@@ -353,19 +349,18 @@ class PostgresDatabase(Database):
         Returns:
             List[MirrorMessage]
         """
-        rows: List[MirrorMessage] = []
         async with self.__pg_cursor() as cursor:
             cursor.row_factory = class_row(MirrorMessage)
             await cursor.execute(
                 """
                 SELECT original_id, original_channel, mirror_id, mirror_channel
                 FROM binding_id
-                WHERE original_id = %s
-                AND original_channel = %s
+                WHERE original_channel = %s
+                AND original_id = %s
                 """,
                 (
-                    original_id,
                     original_channel,
+                    original_id,
                 ),
             )
             rows = await cursor.fetchall()
@@ -384,19 +379,18 @@ class PostgresDatabase(Database):
         Returns:
             List[MirrorMessage]
         """
-        rows: List[MirrorMessage] = []
         async with self.__pg_cursor() as cursor:
             cursor.row_factory = class_row(MirrorMessage)
             await cursor.execute(
                 """
                 SELECT original_id, original_channel, mirror_id, mirror_channel
                 FROM binding_id
-                WHERE original_id = ANY(%s)
-                AND original_channel = %s
+                WHERE original_channel = %s
+                AND original_id = ANY(%s)
                 """,
                 (
-                    original_ids,
                     original_channel,
+                    original_ids,
                 ),
             )
             rows = await cursor.fetchall()
@@ -416,12 +410,12 @@ class PostgresDatabase(Database):
             await cursor.execute(
                 """
                 DELETE FROM binding_id
-                WHERE original_id = %s
-                AND original_channel = %s
+                WHERE original_channel = %s
+                AND original_id = %s
                 """,
                 (
-                    original_id,
                     original_channel,
+                    original_id,
                 ),
             )
 
@@ -439,12 +433,12 @@ class PostgresDatabase(Database):
             await cursor.execute(
                 """
                 DELETE FROM binding_id
-                WHERE original_id = ANY(%s)
-                AND original_channel = %s
+                WHERE original_channel = %s
+                AND original_id = ANY(%s)
                 """,
                 (
-                    original_ids,
                     original_channel,
+                    original_ids,
                 ),
             )
 
@@ -458,7 +452,11 @@ class PostgresDatabase(Database):
                     original_id bigint not null,
                     original_channel bigint not null,
                     mirror_id bigint not null,
-                    mirror_channel bigint not null)
+                    mirror_channel bigint not null
+                );
+
+                CREATE INDEX IF NOT EXISTS binding_id_original_idx 
+                ON binding_id (original_channel, original_id);
                 """
             )
 
